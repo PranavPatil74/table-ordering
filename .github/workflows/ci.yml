@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Lint, typecheck, unit tests, build, e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm version comes from the "packageManager" field in package.json.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Check formatting
+        run: pnpm format:check
+
+      - name: Unit tests
+        run: pnpm test
+
+      # The build needs no secrets: configuration is validated lazily and at server start,
+      # never at build time. Do not add production secrets to this workflow.
+      - name: Build
+        run: pnpm build
+
+      - name: Install Playwright browser
+        run: pnpm e2e:install
+
+      # Builds its own isolated copy (.next-e2e) from the clearly-fake fixture env in e2e/env.mjs,
+      # checks it is wired to the test double, then runs Playwright. No real credentials, and no
+      # Razorpay keys: payments are not exercised yet.
+      - name: End-to-end tests
+        run: pnpm e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+
+  # Database integration tests: every migration plus the seed, RLS/grant boundaries, payment
+  # finalisation, order numbers and concurrency, on a real PostgreSQL 16 service container.
+  # This is plain PostgreSQL with a small test-only Supabase shim (src/test/db/supabase-shim.sql),
+  # NOT the Supabase stack: see the "supabase-replay" job below and docs/database.md.
+  database:
+    name: Database tests (PostgreSQL ${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # supabase/config.toml targets PostgreSQL 17; 16 is the version these tests were developed
+      # and run on. fail-fast is off so a problem on one version does not hide the other.
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # A throwaway service container: the superuser URL is not a secret.
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Migrations, seed, RLS and payment-finalisation tests
+        run: pnpm test:db
+
+  # The only job that runs against the REAL Supabase stack (Auth/GoTrue, PostgREST, Realtime and
+  # the Supabase Postgres image). It replays every migration and the seed, then runs the API
+  # integration tests in src/supabase-it: real Auth users and JWTs, staff permissions through
+  # PostgREST, service-role-only functions, the supabase_realtime publication and Realtime
+  # delivery. The `database` job above covers the SQL on plain PostgreSQL; this one covers what
+  # that cannot. Everything runs against a disposable local stack on the runner. No hosted
+  # project, no repository secrets: the keys are the stack's own local development keys,
+  # masked in the logs and never printed.
+  supabase-replay:
+    name: Supabase stack (migrations, Auth, PostgREST, Realtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: supabase/setup-cli@v3
+        with:
+          version: latest
+      - name: Start local Supabase
+        run: supabase start
+      - name: Reset database (apply all migrations, then seed.sql)
+        run: supabase db reset
+      # psql runs inside the database container (its name is supabase_db_<project_id>), so the job
+      # does not depend on a psql client on the runner or on the published port.
+      - name: Check the seed and the Realtime publication
+        run: |
+          q() { docker exec supabase_db_sandwich-express psql -U postgres -d postgres -Atc "$1"; }
+          test "$(q "select count(*) from public.cafe_tables")" = "5"
+          test "$(q "select count(*) from public.menu_items")" = "16"
+          test "$(q "select count(*) from pg_publication_tables where pubname='supabase_realtime' and schemaname='public' and tablename='orders'")" = "1"
+      - name: Re-run the seed (must be a no-op)
+        run: |
+          docker exec -i supabase_db_sandwich-express psql -U postgres -d postgres -v ON_ERROR_STOP=1 < supabase/seed.sql
+          test "$(docker exec supabase_db_sandwich-express psql -U postgres -d postgres -Atc "select count(*) from public.menu_items")" = "16"
+      # Hand the local stack's connection details to the tests without ever printing them: every
+      # value is registered as a mask before it is written, and the temp file is removed.
+      - name: Export local stack settings (masked)
+        run: |
+          set -euo pipefail
+          umask 077
+          env_file="$RUNNER_TEMP/supabase-status.env"
+          supabase status -o env > "$env_file"
+          set -a; . "$env_file"; set +a
+          rm -f "$env_file"
+          anon="${ANON_KEY:-${PUBLISHABLE_KEY:-}}"
+          service="${SERVICE_ROLE_KEY:-${SECRET_KEY:-}}"
+          # Explicit checks: a failing command inside an && chain does not trip `set -e`.
+          missing=""
+          [ -n "${API_URL:-}" ] || missing="$missing API_URL"
+          [ -n "$anon" ] || missing="$missing ANON_KEY/PUBLISHABLE_KEY"
+          [ -n "$service" ] || missing="$missing SERVICE_ROLE_KEY/SECRET_KEY"
+          [ -n "${DB_URL:-}" ] || missing="$missing DB_URL"
+          if [ -n "$missing" ]; then
+            echo "supabase status did not provide:$missing" >&2
+            exit 1
+          fi
+          echo "::add-mask::$anon"
+          echo "::add-mask::$service"
+          echo "::add-mask::$DB_URL"
+          {
+            echo "SUPABASE_URL=$API_URL"
+            echo "SUPABASE_ANON_KEY=$anon"
+            echo "SUPABASE_SERVICE_ROLE_KEY=$service"
+            echo "SUPABASE_DB_URL=$DB_URL"
+          } >> "$GITHUB_ENV"
+      # The tests wait for Auth and PostgREST to answer (global-setup.ts) before starting.
+      - name: Supabase API integration tests
+        run: pnpm test:supabase
+      # Service logs only (no request headers), to diagnose a failure. Never printed on success.
+      - name: Service logs on failure
+        if: failure()
+        run: |
+          for c in supabase_auth_sandwich-express supabase_rest_sandwich-express supabase_realtime_sandwich-express supabase_db_sandwich-express; do
+            echo "::group::$c (last 60 lines)"
+            docker logs --tail 60 "$c" 2>&1 || true
+            echo "::endgroup::"
+          done
